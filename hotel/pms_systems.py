@@ -189,7 +189,7 @@ def get_guest_language(country) -> str:
     return "None"
 
 #Ensure that even when the api is not available we retry a few more times to get the data
-def make_api_call_with_retry(pms_name, request, parameters) -> str:
+def make_api_call_with_retry(pms_name, request, parameters) -> dict:
     data = None
     pms = get_pms(pms_name)
     retry_times = 0
