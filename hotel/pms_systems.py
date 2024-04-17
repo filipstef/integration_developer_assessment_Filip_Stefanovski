@@ -3,11 +3,13 @@ import inspect
 import sys
 import json
 from collections import namedtuple
+from datetime import timedelta, datetime
+from json import JSONDecodeError
 from typing import Optional
-from datetime import datetime
 import uuid
-from datetime import timedelta
+from django.utils import timezone
 
+from hotel.exceptions import JsonValueError, IncorrectHotelIdException
 from hotel.external_api import (
     get_reservations_for_given_checkin_date,
     get_reservation_details,
@@ -15,8 +17,9 @@ from hotel.external_api import (
     APIError,
 )
 
-from hotel.models import Stay, Guest, Hotel
+from hotel.models import Stay, Guest, Hotel, Language
 
+now = datetime.now()
 
 class PMS(ABC):
     """
@@ -78,51 +81,30 @@ class PMS(ABC):
 
 class PMS_Mews(PMS):
     def clean_webhook_payload(self, payload: str) -> dict:
-        webhook_data = json.loads(payload, object_hook=lambda d: namedtuple('X', d.keys())(*d.values()))
+        if not payload:
+            raise JsonValueError("Incorrect json input")
+        try:
+            webhook_data = json.loads(payload, object_hook=lambda d: namedtuple('X', d.keys())(*d.values()))
+        except JSONDecodeError:
+            raise JSONDecodeError
+
         return webhook_data
 
     def handle_webhook(self, webhook_data: dict) -> bool:
-
         for event in webhook_data.Events:
-            # Ensure that even when the api is not available we retry a few more times to get the data
-            retry_times = 0
-            while retry_times < 10:
-                try:
-                    stay = get_reservation_details(event)
-                    stay = json.loads(stay, object_hook=lambda d: namedtuple('X', d.keys())(*d.values()))
-                    guest = get_guest_details(stay.GuestId)
-                    guest = json.loads(guest, object_hook=lambda d: namedtuple('X', d.keys())(*d.values()))
-                    break
-                except Exception as e:
-                    print(str(e))
-                    retry_times += 1
+            try:
+                stay = make_api_call_with_retry(self.name, get_reservation_details, event.Value.ReservationId)
+                guest = make_api_call_with_retry(self.name, get_guest_details, stay.GuestId)
 
-            now = datetime.now()
+                guest_id = update_or_create_guest(guest)
+                update_or_create_stay(stay, guest_id)
 
-            #Update or create Guest data
-            if not guest.Phone or guest.Phone == 'Not available':
-                guest_id = None
-            else:
-                guest_from_db = Guest.objects.filter(phone=guest.Phone)
-                if guest_from_db.exists():
-                    guest_from_db.update(name= (uuid.uuid4() if not guest.Name else guest.Name ), phone=(uuid.uuid4() if not guest.Phone else guest.Phone), updated_at=now)
-                    guest_id = Guest.objects.get(phone=guest.Phone).id
-                else:
-                    g = Guest(name=(uuid.uuid4() if not guest.Name else guest.Name ), phone=(uuid.uuid4()  if not guest.Phone else guest.Phone), updated_at=now)
-                    g.save()
-                    guest_id = (None if not Guest.objects.filter(phone=guest.Phone).exists() else Guest.objects.get(phone=guest.Phone).id)
-
-            hotel_id = Hotel.objects.all().get(pms_hotel_id=stay.HotelId).id
-
-            #Update or create Stay data
-            stay_from_db = Stay.objects.filter(pms_reservation_id=stay.ReservationId[1][0])
-            if stay_from_db.exists():
-                stay_from_db.update(hotel_id=hotel_id, pms_reservation_id=stay.ReservationId[1][0], pms_guest_id=stay.GuestId, guest_id= guest_id,
-                                    status=stay.Status, checkin=stay.CheckInDate, checkout= stay.CheckOutDate, updated_at=now)
-            else:
-                s = Stay(hotel_id=hotel_id, pms_reservation_id=stay.ReservationId[1][0], pms_guest_id=stay.GuestId, guest_id= guest_id,
-                         status=stay.Status, checkin=stay.CheckInDate, checkout=stay.CheckOutDate,created_at=now)
-                s.save()
+            except IncorrectHotelIdException:
+                continue
+            except ValueError:
+                continue
+            except Exception:
+                return False
 
         return True
     """
@@ -132,80 +114,27 @@ class PMS_Mews(PMS):
     """
     def update_tomorrows_stays(self) -> bool:
         tomorrow_date = (datetime.now() + timedelta(days=1)).date()
-        stays = None
-        # Ensure that even when the api is not available we retry a few more times to get the data
-        retry_times = 0
-        while retry_times < 10:
-            try:
-                stays = get_reservations_for_given_checkin_date(str(tomorrow_date))
-                stays = json.loads(stays, object_hook=lambda d: namedtuple('X', d.keys())(*d.values()))
-                break
-            except Exception as e:
-                print(str(e))
-                retry_times += 1
-        print(stays)
+        stays = make_api_call_with_retry(self.name, get_reservations_for_given_checkin_date, str(tomorrow_date))
+
         for stay in stays:
-            # Ensure that even when the api is not available we retry a few more times to get the data
-            retry_times = 0
-            while retry_times < 10:
-                try:
-                    guest = get_guest_details(stay.GuestId)
-                    guest = json.loads(guest, object_hook=lambda d: namedtuple('X', d.keys())(*d.values()))
-                    break
-                except Exception as e:
-                    print(str(e))
-                    retry_times += 1
+            try:
+                guest = make_api_call_with_retry(self.name, get_guest_details, stay.GuestId)
 
-            now = datetime.now()
-
-            # Update or create Guest data
-            if not guest.Phone or guest.Phone == 'Not available':
-                guest_id = None
-            else:
-                guest_from_db = Guest.objects.filter(phone=guest.Phone)
-                if guest_from_db.exists():
-                    guest_from_db.update(name=(uuid.uuid4() if not guest.Name else guest.Name),
-                                         phone=(uuid.uuid4() if not guest.Phone else guest.Phone), updated_at=now)
-                    guest_id = Guest.objects.get(phone=guest.Phone).id
-                else:
-                    g = Guest(name=(uuid.uuid4() if not guest.Name else guest.Name),
-                              phone=(uuid.uuid4() if not guest.Phone else guest.Phone), updated_at=now)
-                    g.save()
-                    guest_id = (None if not Guest.objects.filter(phone=guest.Phone).exists() else Guest.objects.get(
-                        phone=guest.Phone).id)
-
-            hotel_id = Hotel.objects.all().get(pms_hotel_id=stay.HotelId).id
-
-            # Update or create Stay data
-            stay_from_db = Stay.objects.filter(pms_reservation_id=stay.ReservationId)
-            if stay_from_db.exists():
-                stay_from_db.update(hotel_id=hotel_id, pms_reservation_id=stay.ReservationId,
-                                    pms_guest_id=stay.GuestId, guest_id=guest_id,
-                                    status=stay.Status, checkin=stay.CheckInDate, checkout=stay.CheckOutDate,
-                                    updated_at=now)
-            else:
-                s = Stay(hotel_id=hotel_id, pms_reservation_id=stay.ReservationId, pms_guest_id=stay.GuestId,
-                         guest_id=guest_id,
-                         status=stay.Status, checkin=stay.CheckInDate, checkout=stay.CheckOutDate, created_at=now)
-                s.save()
+                guest_id = update_or_create_guest(guest)
+                update_or_create_stay(stay, guest_id)
+            except IncorrectHotelIdException:
+                continue
+            except ValueError:
+                continue
+            except Exception:
+                return False
 
         return True
 
     def stay_has_breakfast(self, stay: Stay) -> Optional[bool]:
-        # Ensure that even when the api is not available we retry a few more times to get the data
-        s = None
-        retry_times = 0
-        while retry_times < 10:
-            try:
-                s = get_reservation_details(stay.pms_reservation_id)
-                s = json.loads(s, object_hook=lambda d: namedtuple('X', d.keys())(*d.values()))
-                break
-            except Exception as e:
-                print(str(e))
-                retry_times += 1
+        stay_to_check = make_api_call_with_retry(self.name, get_reservation_details, stay.ReservationId)
 
-        return s.BreakfastIncluded
-
+        return stay_to_check.BreakfastIncluded
 
 def get_pms(name):
     fullname = "PMS_" + name.capitalize()
@@ -216,3 +145,65 @@ def get_pms(name):
 
     # if we have a PMS class for the given name, return an instance of it
     return getattr(current_module, fullname)() if fullname in clsnames else False
+
+def update_or_create_guest(guest: Guest) -> int or None:
+    language = get_guest_language(guest.Country)
+    if not guest.Phone or guest.Phone == 'Not available':
+        guest_id = None
+    else:
+        guest_from_db = Guest.objects.filter(phone=guest.Phone)
+        if guest_from_db.exists():
+            guest_from_db.update(name=(uuid.uuid4() if not guest.Name else guest.Name), phone=guest.Phone, language = language,
+                                 updated_at=now)
+            guest_id = Guest.objects.get(phone=guest.Phone).id
+        else:
+            new_guest = Guest(name=(uuid.uuid4() if not guest.Name else guest.Name), phone=guest.Phone, language = language, created_at=now)
+            new_guest.save()
+            guest_id = (None if not Guest.objects.filter(phone=guest.Phone).exists() else Guest.objects.get(
+                phone=guest.Phone).id)
+    return guest_id
+
+def update_or_create_stay(stay: Stay, guest_id):
+    hotel_id = Hotel.objects.all().get(pms_hotel_id=stay.HotelId).id
+
+    if not hotel_id:
+        raise IncorrectHotelIdException("Hotel ID not found")
+
+    stay_from_db = Stay.objects.filter(pms_reservation_id=stay.ReservationId)
+    if stay_from_db.exists():
+        stay_from_db.update(hotel_id=hotel_id, pms_reservation_id=stay.ReservationId, pms_guest_id=stay.GuestId,
+                            guest_id=guest_id, status=stay.Status, checkin=stay.CheckInDate, checkout=stay.CheckOutDate, updated_at=now)
+    else:
+        new_stay = Stay(hotel_id=hotel_id, pms_reservation_id=stay.ReservationId, pms_guest_id=stay.GuestId,
+                 guest_id=guest_id, status=stay.Status, checkin=stay.CheckInDate, checkout=stay.CheckOutDate, created_at=now)
+        new_stay.save()
+
+def get_guest_language(country) -> str:
+    if not country:
+        return "None"
+
+    for choice in Language.choices:
+        if choice[0] == country.lower():
+            return choice[1]
+
+    return "None"
+
+#Ensure that even when the api is not available we retry a few more times to get the data
+def make_api_call_with_retry(pms_name, request, parameters) -> str:
+    data = None
+    pms = get_pms(pms_name)
+    retry_times = 0
+
+    while retry_times < 10:
+        try:
+            data = request(parameters)
+            data = pms.clean_webhook_payload(data)
+            break
+        except APIError as api_error:
+            print(str(api_error))
+            retry_times += 1
+
+    if retry_times == 10:
+        raise APIError
+
+    return data
